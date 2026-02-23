@@ -15,6 +15,24 @@ trait OrmTableCommandHelpers
     protected const ORM_THINKORM = 'tp';
 
     /**
+     * Set to 'db' when promptForTable returns null due to DB connection/permission failure.
+     * Callers can check this to avoid showing redundant table_required message.
+     */
+    protected ?string $lastTablePromptFailureReason = null;
+
+    /**
+     * Severity for DB failures during table prompt.
+     * - error: fatal (e.g. make:crud requires a table)
+     * - warning: non-fatal (e.g. make:model can still generate an empty model)
+     */
+    protected string $tablePromptDbFailureSeverity = 'warning';
+
+    /**
+     * Last printed native DB error message (for deduplication within one command run).
+     */
+    protected ?string $lastDbNativeErrorPrinted = null;
+
+    /**
      * Normalize a connection name into the final key used by Db drivers:
      * - Main project: "mysql"
      * - Plugin: "plugin.<plugin>.<conn>"
@@ -533,6 +551,7 @@ trait OrmTableCommandHelpers
             return null;
         }
 
+        $this->lastTablePromptFailureReason = null;
         if ($skipIfConventionMatch) {
             // If table can be guessed by convention, don't interrupt.
             try {
@@ -540,8 +559,8 @@ trait OrmTableCommandHelpers
                     return null;
                 }
             } catch (\Throwable $e) {
-                // If we cannot even guess due to DB errors, do not block; fall back to empty model.
-                $output->writeln($this->msg('db_unavailable'));
+                $this->writeDbAccessFailed($output, $e, $ormType, $connection, $plugin, $databaseOption);
+                $this->lastTablePromptFailureReason = 'db';
                 return null;
             }
         }
@@ -549,7 +568,8 @@ trait OrmTableCommandHelpers
         try {
             $tables = $this->listTables($ormType, $connection, $plugin, $databaseOption);
         } catch (\Throwable $e) {
-            $output->writeln($this->msg('table_list_failed'));
+            $this->writeDbAccessFailed($output, $e, $ormType, $connection, $plugin, $databaseOption);
+            $this->lastTablePromptFailureReason = 'db';
             return null;
         }
 
@@ -960,5 +980,233 @@ trait OrmTableCommandHelpers
             return !empty($rows[0]['table_exists']);
         }
         return (bool)$con->query("SHOW TABLES LIKE '{$prefix}{$tableNoPrefix}'");
+    }
+
+    protected function buildDbAccessFailedMessage(
+        \Throwable $e,
+        string $ormType,
+        ?string $connection,
+        ?string $plugin = null,
+        ?string $databaseOption = null
+    ): string {
+        $context = $this->extractDbErrorContext($e);
+        $isPermissionDenied = $this->isPermissionDeniedError($context);
+        if ($isPermissionDenied) {
+            [$dbUser, $dbName] = $this->getDbUserAndName($ormType, $connection, $plugin, $databaseOption);
+            $fallback = str_starts_with(Util::getLocale(), 'zh') ? '未知' : 'unknown';
+            $userText = $dbUser !== '' ? $dbUser : $fallback;
+            $dbText = $dbName !== '' ? $dbName : $fallback;
+            $hint = $this->shouldSuggestTableOverride($context) ? $this->msg('db_permission_denied_hint') : '';
+            return $this->msg('db_permission_denied', [
+                '{user}' => $userText,
+                '{database}' => $dbText,
+                '{hint}' => $hint,
+            ]);
+        }
+        $configPath = $this->getDatabaseConfigPath($ormType, $plugin);
+        return $this->msg('db_connect_failed', ['{configPath}' => $configPath]);
+    }
+
+    protected function writeDbAccessFailed(
+        OutputInterface $output,
+        \Throwable $e,
+        string $ormType,
+        ?string $connection,
+        ?string $plugin = null,
+        ?string $databaseOption = null
+    ): void {
+        $severityTag = $this->tablePromptDbFailureSeverity === 'error' ? 'error' : 'comment';
+        $this->writeDbNativeErrorOnce($output, $e, $severityTag);
+
+        $friendly = $this->buildDbAccessFailedMessage($e, $ormType, $connection, $plugin, $databaseOption);
+        if ($severityTag === 'comment') {
+            // Non-fatal flows: show the same text in warning color.
+            $friendly = str_replace(['<error>', '</error>'], ['<comment>', '</comment>'], $friendly);
+        }
+        $output->writeln($friendly);
+    }
+
+    protected function writeDbNativeErrorOnce(OutputInterface $output, \Throwable $e, string $severityTag = 'error'): void
+    {
+        $msg = trim((string)$e->getMessage());
+        if ($msg === '') {
+            return;
+        }
+        if ($this->lastDbNativeErrorPrinted === $msg) {
+            return;
+        }
+        $this->lastDbNativeErrorPrinted = $msg;
+        $tag = $severityTag === 'comment' ? 'comment' : 'error';
+        $output->writeln("<{$tag}>{$msg}</{$tag}>");
+    }
+
+    protected function getDatabaseConfigPath(string $ormType, ?string $plugin): string
+    {
+        $plugin = $this->normalizeOptionValue($plugin);
+        $pluginForConfig = $plugin && $this->pluginHasDbConfig($ormType, $plugin) ? $plugin : null;
+        $baseDir = $pluginForConfig ? "plugin/{$pluginForConfig}/config/" : 'config/';
+        if ($ormType !== self::ORM_THINKORM) {
+            return $baseDir . 'database.php';
+        }
+        $first = $baseDir . 'think-orm.php';
+        $second = $baseDir . 'thinkorm.php';
+        $firstExists = file_exists(base_path($first));
+        if ($firstExists) {
+            return $first;
+        }
+        $secondExists = file_exists(base_path($second));
+        if ($secondExists) {
+            return $second;
+        }
+        return $first;
+    }
+
+    /**
+     * @return array{0:string,1:string} [dbUser, dbName]
+     */
+    protected function getDbUserAndName(
+        string $ormType,
+        ?string $connection,
+        ?string $plugin = null,
+        ?string $databaseOption = null
+    ): array {
+        $connection = $this->resolveConnectionName($ormType, $connection, $plugin, $databaseOption);
+        if ($ormType === self::ORM_THINKORM) {
+            $is_thinkorm_v2 = class_exists(\support\think\Db::class);
+            $configName = $is_thinkorm_v2 ? 'think-orm' : 'thinkorm';
+            $cfg = $this->getThinkOrmConnectionConfig($configName, (string)$connection);
+        } else {
+            $cfg = $this->getLaravelConnectionConfig((string)$connection);
+        }
+        $dbUser = (string)($cfg['username'] ?? $cfg['user'] ?? $cfg['userid'] ?? '');
+        $dbName = (string)($cfg['database'] ?? $cfg['dbname'] ?? $cfg['db_name'] ?? '');
+        return [$dbUser, $dbName];
+    }
+
+    /**
+     * @return array{messages: string[], codes: string[], sqlstates: string[]}
+     */
+    protected function extractDbErrorContext(\Throwable $e): array
+    {
+        $messages = [];
+        $codes = [];
+        $sqlstates = [];
+        $current = $e;
+        while ($current !== null) {
+            $messages[] = (string)$current->getMessage();
+            $code = $current->getCode();
+            if ($code !== null && $code !== '') {
+                $codes[] = (string)$code;
+            }
+            if ($current instanceof \PDOException && is_array($current->errorInfo)) {
+                $sqlstate = (string)($current->errorInfo[0] ?? '');
+                if ($sqlstate !== '') {
+                    $sqlstates[] = $sqlstate;
+                }
+                $driverCode = $current->errorInfo[1] ?? null;
+                if ($driverCode !== null && $driverCode !== '') {
+                    $codes[] = (string)$driverCode;
+                }
+                $driverMsg = $current->errorInfo[2] ?? null;
+                if (is_string($driverMsg) && $driverMsg !== '') {
+                    $messages[] = $driverMsg;
+                }
+            } elseif (property_exists($current, 'errorInfo') && is_array($current->errorInfo)) {
+                $sqlstate = (string)($current->errorInfo[0] ?? '');
+                if ($sqlstate !== '') {
+                    $sqlstates[] = $sqlstate;
+                }
+                $driverCode = $current->errorInfo[1] ?? null;
+                if ($driverCode !== null && $driverCode !== '') {
+                    $codes[] = (string)$driverCode;
+                }
+                $driverMsg = $current->errorInfo[2] ?? null;
+                if (is_string($driverMsg) && $driverMsg !== '') {
+                    $messages[] = $driverMsg;
+                }
+            }
+            $current = $current->getPrevious();
+        }
+        return [
+            'messages' => $messages,
+            'codes' => $codes,
+            'sqlstates' => $sqlstates,
+        ];
+    }
+
+    /**
+     * @param array{messages: string[], codes: string[], sqlstates: string[]} $context
+     */
+    protected function isPermissionDeniedError(array $context): bool
+    {
+        if ($this->isAuthOrConnectionError($context)) {
+            return false;
+        }
+        $codes = array_map('strval', $context['codes']);
+        $sqlstates = array_map('strval', $context['sqlstates']);
+        $message = strtolower(implode(' ', $context['messages']));
+
+        if (in_array('1142', $codes, true) || in_array('1143', $codes, true)) {
+            return true;
+        }
+        if (in_array('42501', $sqlstates, true)) {
+            return true;
+        }
+        if (str_contains($message, 'permission denied') || str_contains($message, 'insufficient privilege')) {
+            return true;
+        }
+        if (str_contains($message, 'command denied')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @param array{messages: string[], codes: string[], sqlstates: string[]} $context
+     */
+    protected function isAuthOrConnectionError(array $context): bool
+    {
+        $codes = array_map('strval', $context['codes']);
+        $sqlstates = array_map('strval', $context['sqlstates']);
+        $message = strtolower(implode(' ', $context['messages']));
+
+        if (in_array('1045', $codes, true) || in_array('1044', $codes, true)) {
+            return true;
+        }
+        if (in_array('2002', $codes, true) || in_array('2003', $codes, true) || in_array('2006', $codes, true) || in_array('2013', $codes, true)) {
+            return true;
+        }
+        if (in_array('28000', $sqlstates, true) || in_array('28p01', array_map('strtolower', $sqlstates), true)) {
+            return true;
+        }
+        if (in_array('08001', $sqlstates, true) || in_array('08004', $sqlstates, true) || in_array('08006', $sqlstates, true)) {
+            return true;
+        }
+        if (str_contains($message, 'access denied for user')) {
+            return true;
+        }
+        if (str_contains($message, 'password authentication failed')) {
+            return true;
+        }
+        if (str_contains($message, 'could not connect') || str_contains($message, 'connection refused') || str_contains($message, 'server has gone away')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @param array{messages: string[], codes: string[], sqlstates: string[]} $context
+     */
+    protected function shouldSuggestTableOverride(array $context): bool
+    {
+        $codes = array_map('strval', $context['codes']);
+        $message = strtolower(implode(' ', $context['messages']));
+        if (in_array('1142', $codes, true) && str_contains($message, 'show tables')) {
+            return true;
+        }
+        if (str_contains($message, 'pg_catalog.pg_tables') || str_contains($message, 'pg_tables')) {
+            return true;
+        }
+        return false;
     }
 }

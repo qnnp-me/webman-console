@@ -287,6 +287,8 @@ class MakeModelCommand extends Command
         $timestamps = 'false';
         $hasCreatedAt = false;
         $hasUpdatedAt = false;
+        $dbFailed = false;
+        $dbFailed = false;
         try {
             $connectionConfig = $this->getLaravelConnectionConfig((string)$connection);
             $prefix = (string)($connectionConfig['prefix'] ?? '');
@@ -392,10 +394,11 @@ class MakeModelCommand extends Command
                 $output?->writeln($this->msg('table_not_found_schema', ['{table}' => (string)$table]));
             }
         } catch (\Throwable $e) {
+            $dbFailed = true;
             $this->reportException($e, $output);
         }
         if (!$table && !$meta_table) {
-            $output?->writeln($this->msg('table_not_found_empty'));
+            $output?->writeln($dbFailed ? $this->msg('table_not_found_empty_db_failed') : $this->msg('table_not_found_empty'));
         }
         $properties = rtrim($properties) ?: ' *';
         $timestamps = $hasCreatedAt && $hasUpdatedAt ? 'true' : 'false';
@@ -569,10 +572,11 @@ EOF;
                 $output?->writeln($this->msg('table_not_found_schema', ['{table}' => (string)$table]));
             }
         } catch (\Throwable $e) {
+            $dbFailed = true;
             $this->reportException($e, $output);
         }
         if (!$table && !$meta_table) {
-            $output?->writeln($this->msg('table_not_found_empty'));
+            $output?->writeln($dbFailed ? $this->msg('table_not_found_empty_db_failed') : $this->msg('table_not_found_empty'));
         }
         $properties = rtrim($properties) ?: ' *';
         $modelNamespace = $is_thinkorm_v2 ? 'support\think\Model' : 'think\Model';
@@ -624,7 +628,7 @@ EOF;
     protected function reportException(\Throwable $e, ?OutputInterface $output = null): void
     {
         if ($output) {
-            $output->writeln('<error>' . $e->getMessage() . '</error>');
+            $this->writeDbNativeErrorOnce($output, $e, 'comment');
             return;
         }
         echo $e->getMessage() . PHP_EOL;

@@ -82,13 +82,15 @@ class MakeCrudCommand extends Command
             return Command::FAILURE;
         }
 
-        $validationEnabled = $this->isValidationEnabled();
+        $validationStatus = $this->getValidationStatus();
+        $validationEnabled = $validationStatus === 'ok';
         if ($validatorPath && !$validationEnabled && !$noValidator) {
             $output->writeln($this->msg('validation_not_enabled'));
             return Command::FAILURE;
         }
 
         $ormType = $this->resolveOrm($orm);
+        $this->tablePromptDbFailureSeverity = 'error';
         [$ok, $connection] = $this->resolveAndValidateConnection($ormType, $plugin, $database, $output);
         if (!$ok) {
             return Command::FAILURE;
@@ -129,7 +131,9 @@ class MakeCrudCommand extends Command
             }
 
             if (!$table) {
-                $output->writeln($this->msg('table_required'));
+                if ($this->lastTablePromptFailureReason !== 'db') {
+                    $output->writeln($this->msg('table_required'));
+                }
                 return Command::FAILURE;
             }
         }
@@ -207,6 +211,16 @@ class MakeCrudCommand extends Command
 
         if ($shouldAskValidator) {
             $shouldGenerateValidator = $this->promptForValidator($input, $output);
+        } elseif (!$validationEnabled && !$noValidator && $input->isInteractive() && !$validatorExplicit) {
+            $skipKey = match ($validationStatus) {
+                'not_installed' => 'validation_not_installed_skip',
+                'not_enabled' => 'validation_not_enabled_skip',
+                'middleware_not_enabled' => 'validation_middleware_not_enabled_skip',
+                default => null,
+            };
+            if ($skipKey !== null) {
+                $output->writeln($this->msg($skipKey));
+            }
         }
 
         // Step 4: resolve validator name + path (derived from controller)
@@ -375,15 +389,22 @@ class MakeCrudCommand extends Command
         return $pos === false ? $name : substr($name, $pos + 1);
     }
 
-    protected function isValidationEnabled(): bool
+    /**
+     * @return 'ok'|'not_installed'|'not_enabled'|'middleware_not_enabled'
+     */
+    protected function getValidationStatus(): string
     {
-        $middlewares = config('plugin.webman.validation.middleware');
-        if (!is_array($middlewares) || $middlewares === []) {
-            return false;
-        }
         $class = 'Webman\\Validation\\Middleware';
         if (!class_exists($class)) {
-            return false;
+            return 'not_installed';
+        }
+        $pluginConfig = config('plugin.webman.validation');
+        if ($pluginConfig === null || (isset($pluginConfig['enable']) && $pluginConfig['enable'] === false)) {
+            return 'not_enabled';
+        }
+        $middlewares = config('plugin.webman.validation.middleware');
+        if (!is_array($middlewares) || $middlewares === []) {
+            return 'middleware_not_enabled';
         }
         foreach ($middlewares as $middleware) {
             if (!is_array($middleware)) {
@@ -392,11 +413,16 @@ class MakeCrudCommand extends Command
             foreach ($middleware as $item) {
                 $normalized = ltrim($item, '\\');
                 if ($normalized === $class) {
-                    return true;
+                    return 'ok';
                 }
             }
         }
-        return false;
+        return 'middleware_not_enabled';
+    }
+
+    protected function isValidationEnabled(): bool
+    {
+        return $this->getValidationStatus() === 'ok';
     }
 
     protected function getDefaultPath(string $type, ?string $plugin): string
